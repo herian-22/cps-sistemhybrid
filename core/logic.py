@@ -20,8 +20,6 @@ class Obstacle:
         self.width   = width
         self.height  = height
         self.depth   = depth
-        # Note: speed is kept for compatibility but not used for custom_obstacles
-        # as they are static. The original update method is removed.
 
 class HybridSystemLogic:
     """
@@ -53,14 +51,23 @@ class HybridSystemLogic:
         self.use_ik        = True    # Toggle Inverse Kinematics vs straight rigid lines
 
         # ── World physical state ─────────────────────────────────────────────
-        self.robot_z       = 0.0     # World forward coordinate
-        self.robot_y_offset= 0.0     # Bobbing
-        self.bounce_velocity= 0.0    # For elastic collision bounce
+        self.robot_z        = 0.0     # World forward coordinate
+        self.robot_y_offset = 0.0     # Bobbing
+        self.bounce_velocity= 0.0     # For elastic collision bounce
 
         # ── Walking gait parameters ──────────────────────────────────────────
         self.walking_phase     = 0.0
         self.walking_speed     = 5.0
         self.walking_amplitude = 30.0
+
+        # ── Hardware Simulation (Realistic Digital Twin) ─────────────────────
+        self.mcu_type     = "ESP32-WROOM-32"
+        self.sensor_type  = "HC-SR04 Ultrasonik"
+        self.servo_type   = "MG996R High Torque"
+        self.mcu_status   = "ACTIVE"
+        self.battery_level= 98.0  # % Lipo Battery
+        self.sensor_min   = 2.0  # HC-SR04 min 2cm
+        self.sensor_max   = 400.0 # HC-SR04 max 400cm
 
         # ── AUTO drive state ─────────────────────────────────────────────────
         self.auto_approach_speed = 0.4
@@ -82,9 +89,6 @@ class HybridSystemLogic:
         self.highlighted_obs_id = None
 
         # ── Signal processing state (continuous → discrete) ──────────────────
-        # raw_signal: noisy continuous reading (sine + noise)
-        # filtered_signal: low-pass filtered version
-        # quantized_event: 0 or 1 (thresholded discrete output)
         self.raw_signal       = 100.0
         self.filtered_signal  = 100.0
         self.filter_alpha     = 0.15   # IIR low-pass coefficient
@@ -96,6 +100,8 @@ class HybridSystemLogic:
         self.history_servos  = [[90.0]*100 for _ in range(4)]
         self.history_raw     = [100.0]*100
         self.history_filtered= [100.0]*100
+        self.history_mode    = [1]*100     # 1 = WALKING, 0 = EVASIVE
+        self.history_z       = [0.0]*100   # Trajectory tracking
 
     def add_custom_obstacle(self, x, z, w, h, d):
         obs_id = f"custom_{len(self.custom_obstacles)}"
@@ -113,7 +119,6 @@ class HybridSystemLogic:
     def set_control(self, mode: ControlMode):
         self.control = mode
         if mode == ControlMode.AUTO:
-            # self.obstacles[0].z = 200.0 # Removed as self.obstacles is removed
             self.distance = 100.0
 
     # ── Main tick ─────────────────────────────────────────────────────────────
@@ -121,9 +126,14 @@ class HybridSystemLogic:
         if not self.is_running: return
         self.time_elapsed += self.DT
 
-        # In AUTO: robot only moves forward if mode is WALKING.
-        # In MANUAL: user controls nothing since it's world physics; we just walk forward infinitely
-        #            but we will use AUTO mechanics to actually advance. So WALKING = advance.
+        # Reality check: Battery drain
+        self.battery_level = max(0.0, self.battery_level - 0.001)
+        if self.battery_level < 15: self.mcu_status = "LOW BATT"
+        if self.battery_level <= 0:
+            self.mcu_status = "CRITICAL (OFF)"
+            self.is_running = False
+            return
+
         if self.mode == SystemMode.WALKING:
             self._walking_dynamics()
         else:
@@ -132,7 +142,7 @@ class HybridSystemLogic:
         # Apply and decay bounce momentum (elastic collision physics)
         if abs(self.bounce_velocity) > 0.1:
             self.robot_z += self.bounce_velocity * self.DT * 50.0
-            self.bounce_velocity *= 0.90  # Friction decay
+            self.bounce_velocity *= 0.88  # Friction decay
 
         # Compute physical distance to next obstacle
         self._auto_calculate_distance()
@@ -150,6 +160,11 @@ class HybridSystemLogic:
         for i in range(4):
             self.history_servos[i].pop(0)
             self.history_servos[i].append(self.servo_angles[i])
+        
+        self.history_mode.pop(0)
+        self.history_mode.append(1 if self.mode == SystemMode.WALKING else 0)
+        self.history_z.pop(0)
+        self.history_z.append(self.robot_z)
 
     # ── Signal processing: continuous → discrete ──────────────────────────────
     def _process_signal(self, base_dist: float):
@@ -158,18 +173,18 @@ class HybridSystemLogic:
           1. Raw signal = base + noise  (continuous, noisy)
           2. Filtered = IIR low-pass filter  (smoothed continuous)
           3. Quantized event = threshold guard  (discrete 0/1)
-        The discrete guard only fires when the FILTERED value crosses the threshold.
         """
         # 1. Inject noise
         noise = random.gauss(0, 1.5)
-        self.raw_signal = base_dist + noise
+        # Reality check: HC-SR04 has physical range limits
+        clamped_base = max(self.sensor_min, min(self.sensor_max, base_dist))
+        self.raw_signal = clamped_base + noise
 
         # 2. IIR low-pass filter: y[n] = α·x[n] + (1-α)·y[n-1]
         self.filtered_signal = (self.filter_alpha * self.raw_signal
                                 + (1 - self.filter_alpha) * self.filtered_signal)
 
-        # 3. Threshold quantisation (with small dead-band to avoid chatter)
-        # Previous event is remembered (hysteresis) in normal mode
+        # 3. Threshold quantisation (with hysteresis dead-band)
         if self.zeno_mode:
             # Collapse hysteresis – triggers Zeno chattering
             self.quantized_event = 1 if self.filtered_signal <= 25.0 else 0
@@ -186,13 +201,13 @@ class HybridSystemLogic:
         """Guard uses filtered/quantized signal, NOT noisy raw."""
         old = self.mode
 
-        # Check collision with custom obstacles
-        # Simple bounding box check
+        # Check collision with custom obstacles (bounding box check)
         custom_danger = False
         danger_id = None
         for obs in self.custom_obstacles:
-            # Distance <= 25cm triggers evasion
-            if 0 < (obs.z - self.robot_z - obs.depth/2) < 25 and abs(obs.x) < 50 + obs.width/2:
+            front_dist = obs.z - self.robot_z - obs.depth / 2
+            # Bug fix: check front_dist >= 0 to avoid behind-obstacle triggers
+            if 0 <= front_dist < 25 and abs(obs.x) < 50 + obs.width / 2:
                 custom_danger = True
                 danger_id = obs.id
                 break
@@ -200,19 +215,20 @@ class HybridSystemLogic:
         if custom_danger:
             self.quantized_event = 1
             self.highlighted_obs_id = danger_id
-        elif not custom_danger and self.zeno_mode:
-            # Revert to normal sensor if custom obstacle passed
-            pass # keep standard quantized_event check
         else:
+            # Bug fix: always clear highlight when no custom danger
             self.highlighted_obs_id = None
 
         if self.mode == SystemMode.WALKING and self.quantized_event == 1:
             self.mode = SystemMode.EVASIVE
             self._reset_map()
-            self.transition_count += 1; self.just_transitioned = True
+            self.transition_count += 1
+            self.just_transitioned = True
         elif self.mode == SystemMode.EVASIVE and self.quantized_event == 0:
             self.mode = SystemMode.WALKING
-            self.transition_count += 1; self.just_transitioned = True
+            self.transition_count += 1
+            self.just_transitioned = True
+
         if self.mode is old:
             self.just_transitioned = False
 
@@ -224,23 +240,25 @@ class HybridSystemLogic:
         """Calculate physical distance to the nearest forward obstacle globally."""
         closest = 9999.0
         for obs in self.custom_obstacles:
-            if obs.z > self.robot_z - (obs.depth/2):
+            front_edge = obs.z - obs.depth / 2
+            # Only consider obstacles ahead of the robot
+            if obs.z > self.robot_z:
                 # Physical horizontal overlap check
-                if abs(obs.x) < 50 + obs.width/2:
-                    d = obs.z - self.robot_z - (obs.depth/2)
-                    if d < closest: closest = d
-        
-        # Hybrid Automaton Rule: Elastic Collision
+                if abs(obs.x) < 50 + obs.width / 2:
+                    d = front_edge - self.robot_z
+                    if d < closest:
+                        closest = d
+
+        # Bug fix: improved elastic collision – snap precisely to surface
         if closest <= 0:
-            # v+ = -e * v-
-            # Robot snaps to surface
-            self.robot_z += (closest - 0.1)
-            # Fling backward proportionally to walking_speed
-            e = 0.6  # Coefficient of restitution
+            # Snap robot back to the surface (don't let it pass through)
+            self.robot_z += closest - 0.5
+            # Elastic bounce: v+ = -e * v-
+            e = 0.55  # Coefficient of restitution
             self.bounce_velocity = -e * (self.walking_speed * 15.0)
-            self.distance = 0.0
+            self.distance = 0.5
         else:
-            self.distance = max(0.0, closest)
+            self.distance = max(0.0, min(closest, 999.0))
 
     def _reset_map(self):
         self.walking_phase += math.pi / 2
@@ -252,18 +270,24 @@ class HybridSystemLogic:
 
         self.walking_phase += self.walking_speed * self.DT
         a, ph = self.walking_amplitude, self.walking_phase
-        self.servo_angles[0] = 90 + a*math.sin(ph)
-        self.servo_angles[1] = 90 + a*math.sin(ph + math.pi)
-        self.servo_angles[2] = 90 + a*math.sin(ph)
-        self.servo_angles[3] = 90 + a*math.sin(ph + math.pi)
+        self.servo_angles[0] = 90 + a * math.sin(ph)
+        self.servo_angles[1] = 90 + a * math.sin(ph + math.pi)
+        self.servo_angles[2] = 90 + a * math.sin(ph)
+        self.servo_angles[3] = 90 + a * math.sin(ph + math.pi)
 
         # Bobbing
         self.robot_y_offset = abs(math.sin(ph)) * 3.0
 
     def _evasive_dynamics(self):
+        """Bug fix: robot now also moves backward while evading."""
         targets = [45.0, 135.0, 45.0, 135.0]
         for i in range(4):
             self.servo_angles[i] += (targets[i] - self.servo_angles[i]) * 0.15
+
+        # Back off slowly while in evasive mode (if bounce already decayed)
+        if abs(self.bounce_velocity) < 0.5:
+            self.robot_z -= (self.walking_speed / 5.0) * 3.0 * self.DT
+        self.robot_y_offset = 0.0
 
     # ── Reset ─────────────────────────────────────────────────────────────────
     def reset(self):
@@ -272,6 +296,7 @@ class HybridSystemLogic:
         self.servo_angles = [90.0]*4
         self.time_elapsed = 0.0
         self.walking_phase = 0.0
+        self.robot_y_offset = 0.0
         self.transition_count = 0
         self.just_transitioned = False
         self.auto_backoff = False
@@ -281,3 +306,14 @@ class HybridSystemLogic:
         self.highlighted_obs_id = None
         self.robot_z = 0.0
         self.bounce_velocity = 0.0
+        # Bug fix: also reset history buffers so plots clear on reset
+        self.history_dist     = [100.0]*self.history_size
+        self.history_raw      = [100.0]*self.history_size
+        self.history_filtered = [100.0]*self.history_size
+        self.history_servos   = [[90.0]*self.history_size for _ in range(4)]
+        self.history_mode     = [1]*self.history_size
+        self.history_z        = [0.0]*self.history_size
+        
+        # Reset hardware status
+        self.battery_level    = 98
+        self.mcu_status       = "ACTIVE"

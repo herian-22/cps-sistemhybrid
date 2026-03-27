@@ -6,7 +6,9 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont
 from core.logic import HybridSystemLogic, SystemMode, ControlMode
 from ui.widgets.robot_3d import Robot3DWidget
-from ui.widgets.analytics import StateDiagramWidget, RealTimePlotWidget, SignalPanel
+from ui.widgets.analytics import (StateDiagramWidget, RealTimePlotWidget, SignalPanel, 
+                                 SignalAnalysisWidget, ModeTransitionWidget, 
+                                 TrajectoryWidget, ServoResponseWidget)
 from ui.widgets.gauges import ServoWidget, DistanceWidget
 
 # ── Color palette ─────────────────────────────────────────────────────────────
@@ -104,7 +106,12 @@ class MainWindow(QMainWindow):
         body.addLayout(self._viewport(), 1)
         self.tabs.addTab(self.live_tab, "Live Simulation")
 
-        # Tab 2: Global Configuration
+        # Tab 2: Analytics Dashboard (Deep Analysis)
+        self.analytics_tab = QWidget()
+        self._build_analytics_tab(self.analytics_tab)
+        self.tabs.addTab(self.analytics_tab, "Analytics Dashboard")
+
+        # Tab 3: Global Configuration
         self.config_tab = QWidget()
         self._build_config_tab(self.config_tab)
         self.tabs.addTab(self.config_tab, "Global Configuration")
@@ -191,9 +198,24 @@ class MainWindow(QMainWindow):
     def _viewport(self):
         lay = QVBoxLayout(); lay.setContentsMargins(0,0,0,0); lay.setSpacing(0)
 
+        # Container for 3D View and HUD Overlays (Z-stacking)
+        self.view_container = QWidget()
+        v_glay = QGridLayout(self.view_container)
+        v_glay.setContentsMargins(0,0,0,0)
+
         self.robot_3d = Robot3DWidget()
         self.robot_3d.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        lay.addWidget(self.robot_3d, 3)
+        v_glay.addWidget(self.robot_3d, 0, 0)
+
+        # HUD Overlay (Digital Twin Status)
+        self.hud = QLabel("MCU: ACTIVE\nBATT: 98.0%\nDIST: 100 CM\nMODE: WALKING")
+        self.hud.setStyleSheet("color: #10b981; background: rgba(15, 23, 42, 180); "
+                               "padding: 15px; border-radius: 10px; border: 1px solid #334155; "
+                               "font-family: 'Consolas', 'Courier New', monospace; font-size: 13px; margin: 15px;")
+        self.hud.setAttribute(Qt.WA_TransparentForMouseEvents)
+        v_glay.addWidget(self.hud, 0, 0, Qt.AlignTop | Qt.AlignRight)
+
+        lay.addWidget(self.view_container, 3)
 
         # Analytics strip — fixed height so it doesn't squash the 3D view
         strip = QFrame()
@@ -227,6 +249,47 @@ class MainWindow(QMainWindow):
         lay.addWidget(strip)
         return lay
 
+    def _build_analytics_tab(self, parent):
+        play = QVBoxLayout(parent); play.setContentsMargins(20,20,20,20); play.setSpacing(20)
+        
+        header = QLabel("DEEP ANALYTICS DASHBOARD")
+        header.setStyleSheet(f"color:{C['blue']}; font-size:18px; font-weight:bold; letter-spacing:1px;")
+        play.addWidget(header)
+
+        grid = QGridLayout()
+        grid.setSpacing(20)
+        
+        # 1. Signal Filter Analysis
+        self.ana_signal = SignalAnalysisWidget(
+            "Grafik Perbandingan Sinyal (Filter Analysis)",
+            "Tunjukkan bagaimana filter IIR berhasil meredam noise sensor sehingga sistem tidak melakukan transisi 'palsu'."
+        )
+        grid.addWidget(self.ana_signal, 0, 0)
+        
+        # 2. Mode Transition
+        self.ana_mode = ModeTransitionWidget(
+            "Grafik Transisi Mode (Hybrid Automata)",
+            "Tunjukkan titik waktu tepat saat robot mendeteksi rintangan (distance < 20) dan mengubah perilakunya."
+        )
+        grid.addWidget(self.ana_mode, 0, 1)
+        
+        # 3. Trajectory
+        self.ana_traj = TrajectoryWidget(
+            "Grafik Koordinat Robot (Trajectory)",
+            "Jika garisnya lurus, robot berjalan konstan. Jika ada lekukan atau berhenti, itu menunjukkan robot sedang dalam mode EVASIVE atau terkena efek pantulan (bounce)."
+        )
+        grid.addWidget(self.ana_traj, 1, 0)
+        
+        # 4. Actuator Response
+        self.ana_actuator = ServoResponseWidget(
+            "Analisis Sudut Servo (Actuator Response)",
+            "Lihat pola gelombang sinus saat WALKING dan bagaimana polanya berubah drastis menjadi garis statis saat masuk ke mode EVASIVE."
+        )
+        grid.addWidget(self.ana_actuator, 1, 1)
+        
+        play.addLayout(grid)
+        play.addStretch()
+
     def _build_config_tab(self, parent):
         play = QHBoxLayout(parent); play.setContentsMargins(30,30,30,30); play.setSpacing(30)
 
@@ -236,7 +299,7 @@ class MainWindow(QMainWindow):
         # Kinematics
         kf = QFrame(); kl = QVBoxLayout(kf); kf.setObjectName("SideSection")
         kl.addWidget(QLabel("INVERSE KINEMATICS (IK) - LEG PROPORTIONS"))
-        
+
         self.chk_ik = QCheckBox("Enable Inverse Kinematics Mechanism")
         self.chk_ik.setChecked(True)
         self.chk_ik.toggled.connect(lambda c: setattr(self.logic, 'use_ik', c))
@@ -279,13 +342,15 @@ class MainWindow(QMainWindow):
         form.addWidget(QLabel("Z (depth):"), 0,2);   self.spin_z = QSpinBox(); self.spin_z.setRange(0,3000); self.spin_z.setValue(300); form.addWidget(self.spin_z, 0,3)
         form.addWidget(QLabel("Width:"), 1,0);       self.spin_w = QSpinBox(); self.spin_w.setRange(10,500); self.spin_w.setValue(60); form.addWidget(self.spin_w, 1,1)
         form.addWidget(QLabel("Height:"), 1,2);      self.spin_h = QSpinBox(); self.spin_h.setRange(10,500); self.spin_h.setValue(90); form.addWidget(self.spin_h, 1,3)
+        form.addWidget(QLabel("Depth:"), 2,0);       self.spin_d = QSpinBox(); self.spin_d.setRange(10,500); self.spin_d.setValue(60); form.addWidget(self.spin_d, 2,1)
         ol.addLayout(form)
 
         btn_add = QPushButton("➕ ADD OBSTACLE"); btn_add.clicked.connect(self.add_custom_obs)
         ol.addWidget(btn_add)
 
-        self.obs_list = QListWidget(); self.obs_list.setFixedHeight(150)
+        self.obs_list = QListWidget(); self.obs_list.setFixedHeight(180)
         ol.addWidget(self.obs_list)
+        self.refresh_obs_list()
 
         btn_del = QPushButton("❌ REMOVE SELECTED")
         btn_del.setObjectName("Sec"); btn_del.clicked.connect(self.del_custom_obs)
@@ -301,7 +366,7 @@ class MainWindow(QMainWindow):
     def add_custom_obs(self):
         x, z = self.spin_x.value(), self.spin_z.value()
         w, h = self.spin_w.value(), self.spin_h.value()
-        d = w
+        d = self.spin_d.value()
         self.logic.add_custom_obstacle(x, z, w, h, d)
         self.refresh_obs_list()
 
@@ -314,10 +379,9 @@ class MainWindow(QMainWindow):
     def refresh_obs_list(self):
         self.obs_list.clear()
         for i, o in enumerate(self.logic.custom_obstacles):
-            self.obs_list.addItem(f"[{o.id}] X:{o.x} Z:{o.z} | W:{o.width} H:{o.height}")
+            self.obs_list.addItem(f"[{o.id}] X:{int(o.x)} Z:{int(o.z)} | W:{o.width} H:{o.height} D:{o.depth}")
 
     def on_dist(self, v):
-        self.logic.set_distance(float(v))
         self.dist_view.setDistance(float(v))
 
     def toggle_run(self):
@@ -347,9 +411,11 @@ class MainWindow(QMainWindow):
         self.btn_zeno.setStyle(self.btn_zeno.style())
 
     def reset_sim(self):
-        self.logic.reset(); self.logic.is_running = False
+        self.logic.reset()
+        self.logic.is_running = False
         self.dist_slider.setValue(100)
         self.btn_run.setText("▶  START")
+        self.refresh_obs_list()
 
     def reset_camera(self):
         self.robot_3d.rot_x = 0.5
@@ -370,8 +436,29 @@ class MainWindow(QMainWindow):
             self.logic.history_filtered,
             self.logic.quantized_event
         )
+        
+        # New Analytics Dashboard update
+        self.ana_signal.setData(self.logic.history_raw, self.logic.history_filtered)
+        self.ana_mode.setData(self.logic.history_mode)
+        self.ana_traj.setData(self.logic.history_z)
+        self.ana_actuator.setData(self.logic.history_servos[:2]) # Only S1 and S2
+        
+        # HUD Overlay Update
+        hud_col = "#10b981" if self.logic.mode == SystemMode.WALKING else "#ef4444"
+        if self.logic.mcu_status != "ACTIVE": hud_col = "#f59e0b"
+        self.hud.setText(f"MCU: {self.logic.mcu_status}\n"
+                         f"BATT: {self.logic.battery_level:.1f}%\n"
+                         f"DIST: {self.logic.distance:.1f} CM\n"
+                         f"MODE: {self.logic.mode.value}")
+        self.hud.setStyleSheet(f"color: {hud_col}; background: rgba(15, 23, 42, 180); "
+                               "padding: 15px; border-radius: 10px; border: 1px solid #334155; "
+                               "font-family: 'Consolas', monospace; font-size: 13px; margin: 15px;")
+
         for i in range(4):
             self.gauges[i].setAngle(self.logic.servo_angles[i])
+
+        if self.logic.is_running:
+            self.dist_view.setDistance(self.logic.distance)
 
         # Navbar badges
         walking = (self.logic.mode == SystemMode.WALKING)
