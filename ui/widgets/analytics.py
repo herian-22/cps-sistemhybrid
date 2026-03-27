@@ -44,7 +44,8 @@ class StateDiagramWidget(QWidget):
         painter.drawText(QRectF(mx-40,h/2+10,80,14), Qt.AlignCenter, "← d≥30")
 
         # State bubbles
-        for pos, m, name in [(pw, SystemMode.WALKING,"WALKING"),(pe, SystemMode.EVASIVE,"EVASIVE")]:
+        states = [(pw, SystemMode.WALKING,"WALKING"), (pe, SystemMode.NAVIGATING,"NAVIGATE")]
+        for pos, m, name in states:
             active = (self.mode == m)
             painter.setBrush(QBrush(QColor("#3b82f6" if active else "#1e293b")))
             painter.setPen(QPen(QColor("#ffffff" if active else "#475569"), 2 if active else 1))

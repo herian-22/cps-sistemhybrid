@@ -1,19 +1,12 @@
 import math
 import time
+import numpy as np
 from PySide6.QtWidgets import QWidget
 from PySide6.QtCore import Qt, QPoint, QPointF
 from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QPolygonF
 from ui.utils.projection import project
 
 FLOOR_Y   = -120  # ground plane Y coordinate
-
-def _solve_ik(ty, tz, L1, L2):
-    D = math.sqrt(ty**2 + tz**2)
-    D = max(abs(L1-L2)+0.1, min(L1+L2-0.1, D))
-    cos_q2 = max(-1.0, min(1.0, (D**2-L1**2-L2**2)/(2*L1*L2)))
-    q2 = math.acos(cos_q2)
-    q1 = math.atan2(tz, ty) - math.atan2(L2*math.sin(q2), L1+L2*math.cos(q2))
-    return q1, q2
 
 
 class Robot3DWidget(QWidget):
@@ -25,14 +18,17 @@ class Robot3DWidget(QWidget):
     """
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.angles    = [90.0]*4
+        self.angles    = [90.0]*8
         self.distance  = 100.0
         self.femur_len = 50.0
         self.tibia_len = 50.0
+        self.robot_x   = 0.0
         self.robot_z   = 0.0
+        self.robot_rotation = 0.0
         self.robot_y_offset = 0.0
         self.use_ik    = True
-        self.custom_obstacles = []   # custom placed + gazebo static
+        self.custom_obstacles = []
+        self.planned_path = []
         self.highlighted_obs_id = None
 
         self.rot_x = 0.5
@@ -50,16 +46,28 @@ class Robot3DWidget(QWidget):
         self.distance      = logic.distance
         self.femur_len     = logic.femur_len
         self.tibia_len     = logic.tibia_len
+        self.robot_x       = logic.robot_x
         self.robot_z       = logic.robot_z
+        self.robot_rotation= logic.robot_rotation
         self.robot_y_offset= logic.robot_y_offset
         self.use_ik        = logic.use_ik
         self.custom_obstacles   = logic.custom_obstacles
+        self.occupancy_grid     = logic.occupancy_grid.grid
+        self.planned_path       = logic.planned_path
         self.highlighted_obs_id = logic.highlighted_obs_id
         self.update()
 
     def p3(self, x, y, z):
         return project(x, y, z, self.width(), self.height(),
                        self.rot_x, self.rot_y, self.focal_length, self.zoom)
+
+    def world_to_local(self, wx, wz):
+        dx = wx - self.robot_x
+        dz = wz - self.robot_z
+        rad = math.radians(-self.robot_rotation)
+        lx = dx * math.cos(rad) - dz * math.sin(rad)
+        lz = dx * math.sin(rad) + dz * math.cos(rad)
+        return lx, lz
 
     def mousePressEvent(self, e):
         self.last_mouse_pos = e.position().toPoint()
@@ -87,95 +95,165 @@ class Robot3DWidget(QWidget):
             self._draw_path(painter)
 
         dl = []
+        try:
+            painter.setRenderHint(QPainter.Antialiasing)
+            t = time.time()
 
-        # ── Custom / Map obstacles ────────────────────────────────────────────
-        cc = (QColor(14,165,233,220), QColor(2,132,199,210), QColor(3,105,161,200)) # cyan
-        hc = (QColor(244,63,94,220),  QColor(225,29,72,210),  QColor(190,18,60,200))  # pink highlight
-        for obs in self.custom_obstacles:
-            c = hc if obs.id == self.highlighted_obs_id else cc
-            render_z = obs.z - self.robot_z
-            if render_z < -300: continue
-            dl.append((float(render_z),
-                       (lambda _obs, _c, _rz: lambda p:
-                        self._draw_box(p, _obs.x, FLOOR_Y, _rz,
-                                       _obs.width, _obs.height, _obs.depth,
-                                       _c[0], _c[1], _c[2], glow=(_obs.id==self.highlighted_obs_id)))(obs, c, render_z)))
+            if self.show_grid:
+                self._draw_floor_grid(painter)
+                self._draw_path(painter)
 
-        dl.append((1.0,  self._draw_ground_shadow))
-        dl.append((0.0,  self._draw_robot_body))
-        dl.append((-5.0, lambda p: self._draw_sensor_beam(p, 160, t)))
+            dl = []
 
-        bw, bl = 100, 160
-        mounts = [(-bw/2,0,-bl/2),(bw/2,0,-bl/2),(-bw/2,0,bl/2),(bw/2,0,bl/2)]
-        colors = ["#ef4444","#3b82f6","#10b981","#f59e0b"]
-        for i,(lx,ly,lz) in enumerate(mounts):
-            ar  = math.radians(self.angles[i]-90)
-            if self.use_ik:
-                ty_ =  self.femur_len*math.sin(ar)
-                tz_ = -(self.femur_len*math.cos(ar)+self.tibia_len*0.8)
-                try: q1, q2 = _solve_ik(ty_, tz_, self.femur_len, self.tibia_len)
-                except: q1, q2 = 0.0, 0.0
-                kx,ky,kz = lx, ly+self.femur_len*math.sin(q1)+self.robot_y_offset, lz+self.femur_len*math.cos(q1)
-                fx,fy,fz = kx, ky-self.robot_y_offset+self.tibia_len*math.sin(q1+q2), kz+self.tibia_len*math.cos(q1+q2)
-                dl.append(((lz+kz+fz)/3,
-                           (lambda _i,_lx,_ly,_lz,_q1,_q2,_c,_ro:
-                            lambda p: self._draw_ik_leg(p,_i,_lx,_ly,_lz,_q1,_q2,_c,_ro)
-                            )(i,lx,ly,lz,q1,q2,colors[i], self.robot_y_offset)))
-            else:
-                # Rigid straight leg (no knee) directly down to floor target
-                fx = lx
-                fy = ly - (self.femur_len + self.tibia_len) * 0.8
-                fz = -(self.femur_len + self.tibia_len) * math.cos(ar)
-                dl.append(((lz+fz)/2,
-                           (lambda _i,_lx,_ly,_lz,_fx,_fy,_fz,_c,_ro:
-                            lambda p: self._draw_rigid_leg(p,_i,_lx,_ly,_lz,_fx,_fy,_fz,_c,_ro)
-                            )(i,lx,ly,lz,fx,fy,fz,colors[i], self.robot_y_offset)))
+            # ── Unmapped Physical Obstacles (Holographic Blue) ────────────────────
+            c_holo = (QColor(14,165,233,60), QColor(2,132,199,50), QColor(3,105,161,40)) 
+            c_high = (QColor(244,63,94,220),  QColor(225,29,72,210),  QColor(190,18,60,200)) 
+            for obs in self.custom_obstacles:
+                c = c_high if getattr(self, 'highlighted_obs_id', None) == obs.id else c_holo
+                if abs(obs.x - self.robot_x) > 4000 or abs(obs.z - self.robot_z) > 4000: continue
+                lx, lz = self.world_to_local(obs.x, obs.z)
+                if lz < -500: continue
+                dl.append((float(lz),
+                           (lambda _obs, _c: lambda p:
+                            self._draw_box(p, _obs.x, FLOOR_Y, _obs.z,
+                                           _obs.width, _obs.height, _obs.depth,
+                                           _c[0], _c[1], _c[2], glow=(_obs.id==getattr(self, 'highlighted_obs_id', None))))(obs, c)))
 
-        dl.sort(key=lambda x: x[0], reverse=True)
-        for _, fn in dl:
-            fn(painter)
+            # ── Map obstacles (Occupancy Grid) (Solid Concrete) ───────────────────
+            from core.pathfinding import CELL_SIZE, OFFSET
+            cc = (QColor(100,116,139,220), QColor(71,85,105,210), QColor(51,65,85,200)) # Concrete gray
+            
+            if hasattr(self, 'occupancy_grid') and self.occupancy_grid is not None:
+                # Find all cells with occupancy > 0.9
+                # If it's a grid object, use .grid
+                grid_data = getattr(self.occupancy_grid, 'grid', self.occupancy_grid)
+                off = getattr(self.occupancy_grid, 'OFFSET', OFFSET)
+                res = getattr(self.occupancy_grid, 'RESOLUTION', CELL_SIZE)
+                
+                if isinstance(grid_data, np.ndarray):
+                    gz_indices, gx_indices = np.where(grid_data > 0.9)
+                    
+                    for gz, gx in zip(gz_indices, gx_indices):
+                        wx = (gx - off) * res
+                        wz = (gz - off) * res
+                        
+                        if abs(wx - self.robot_x) > 1500 or abs(wz - self.robot_z) > 1500: continue
+                        
+                        lx, lz = self.world_to_local(wx, wz)
+                        if lz < -500: continue
+                        
+                        dl.append((float(lz),
+                                (lambda _wx, _wz, _c: lambda p:
+                                    self._draw_box(p, _wx, FLOOR_Y, _wz,
+                                                res, 80, res,
+                                                _c[0], _c[1], _c[2], glow=False))(wx, wz, cc)))
 
-        if self.show_axes:
-            self._draw_coordinate_axes(painter)
-            self._draw_compass(painter)
+            if self.planned_path:
+                dl.append((0.0, self._draw_planned_path))
+
+            dl.append((1.0,  self._draw_ground_shadow))
+            dl.append((0.0,  self._draw_robot_body))
+            dl.append((-5.0, lambda p: self._draw_ultrasonic_waves(p, 160, t)))
+
+            bw, bl = 100, 160
+            mounts = [(-bw/2,0,-bl/2),(bw/2,0,-bl/2),(-bw/2,0,bl/2),(bw/2,0,bl/2)]
+            colors = ["#ef4444","#3b82f6","#10b981","#f59e0b"]
+            for i,(lx,ly,lz) in enumerate(mounts):
+                q1 = math.radians(self.angles[i*2] - 90)
+                q2 = math.radians(self.angles[i*2+1] - 90)
+                
+                if self.use_ik:
+                    # Base sort depth approximation on leg joints
+                    kx,ky,kz = lx, ly+self.femur_len*math.sin(q1)+self.robot_y_offset, lz+self.femur_len*math.cos(q1)
+                    fx,fy,fz = kx, ky-self.robot_y_offset+self.tibia_len*math.sin(q1+q2), kz+self.tibia_len*math.cos(q1+q2)
+                    dl.append(((lz+kz+fz)/3,
+                               (lambda _i,_lx,_ly,_lz,_q1,_q2,_c,_ro:
+                                lambda p: self._draw_ik_leg(p,_i,_lx,_ly,_lz,_q1,_q2,_c,_ro)
+                                )(i,lx,ly,lz,q1,q2,colors[i], self.robot_y_offset)))
+                else:
+                    # Rigid straight leg direct to floor if IK disabled
+                    fx = lx
+                    fy = ly - (self.femur_len + self.tibia_len) * 0.8
+                    fz = -(self.femur_len + self.tibia_len) * math.cos(q1)
+                    dl.append(((lz+fz)/2,
+                               (lambda _i,_lx,_ly,_lz,_fx,_fy,_fz,_c,_ro:
+                                lambda p: self._draw_rigid_leg(p,_i,_lx,_ly,_lz,_fx,_fy,_fz,_c,_ro)
+                                )(i,lx,ly,lz,fx,fy,fz,colors[i], self.robot_y_offset)))
+
+            dl.sort(key=lambda x: x[0], reverse=True)
+            for _, fn in dl:
+                fn(painter)
+
+            if self.show_axes:
+                self._draw_coordinate_axes(painter)
+                self._draw_compass(painter)
+        finally:
+            painter.end()
 
     def _draw_floor_grid(self, painter):
-        gc = QColor(71,85,105)
-        offset = self.robot_z % 150  # Infinite scrolling
+        gc = QColor(71,85,105, 50)
+        
+        # Draw world-aligned grid across a local viewing box
+        view_radius = 2500
+        grid_size = 150
+        
+        start_x = int((self.robot_x - view_radius) / grid_size) * grid_size
+        end_x   = int((self.robot_x + view_radius) / grid_size) * grid_size
+        start_z = int((self.robot_z - view_radius) / grid_size) * grid_size
+        end_z   = int((self.robot_z + view_radius) / grid_size) * grid_size
 
-        for i in range(-25,26):  # Widen base X lines from 12 to 25
-            a = 90 if i==0 else 28
-            painter.setPen(QPen(QColor(gc.red(),gc.green(),gc.blue(),a),1))
-            painter.drawLine(self.p3(i*100,FLOOR_Y,-500), self.p3(i*100,FLOOR_Y,3500))
-        for j in range(-4,26):
-            a = int(max(0,90-j*3))
-            painter.setPen(QPen(QColor(gc.red(),gc.green(),gc.blue(),a),1))
-            z_pos = j*150 - offset
-            painter.drawLine(self.p3(-2500,FLOOR_Y,z_pos), self.p3(2500,FLOOR_Y,z_pos))
+        painter.setPen(QPen(gc, 1))
+        # Z-lines
+        for x in range(start_x, end_x + 1, grid_size):
+            p1 = self.p3(*self.world_to_local(x, start_z)[:1], FLOOR_Y, self.world_to_local(x, start_z)[1])
+            p2 = self.p3(*self.world_to_local(x, end_z)[:1], FLOOR_Y, self.world_to_local(x, end_z)[1])
+            if p1 and p2: painter.drawLine(p1, p2)
+            
+        # X-lines
+        for z in range(start_z, end_z + 1, grid_size):
+            p1 = self.p3(*self.world_to_local(start_x, z)[:1], FLOOR_Y, self.world_to_local(start_x, z)[1])
+            p2 = self.p3(*self.world_to_local(end_x, z)[:1], FLOOR_Y, self.world_to_local(end_x, z)[1])
+            if p1 and p2: painter.drawLine(p1, p2)
+
+    def _draw_planned_path(self, painter):
+        painter.setPen(QPen(QColor(16, 185, 129, 200), 4, Qt.DashLine))
+        pts = []
+        for (wx, wz) in self.planned_path:
+            lx, lz = self.world_to_local(wx, wz)
+            pts.append(self.p3(lx, FLOOR_Y+2, lz))
+        if pts:
+            # Connect current pos to first path node
+            p0 = self.p3(0, FLOOR_Y+2, 0)
+            painter.drawLine(p0, pts[0])
+            painter.drawPolyline(QPolygonF(pts))
 
     def _draw_path(self, painter):
-        fy = FLOOR_Y+1
-        # To make dashes scroll, we draw a very long path
-        pts = [self.p3(-155,fy,-500),self.p3(155,fy,-500),
-               self.p3(155,fy,2800), self.p3(-155,fy,2800)]
-        painter.setBrush(QBrush(QColor(30,41,59,80))); painter.setPen(Qt.NoPen)
-        painter.drawPolygon(QPolygonF(pts))
-        # Optional: could make dashed line scroll too, but grid is enough for the effect
+        pass # Disabling static path polygon in true 2D mode
 
     def _draw_ground_shadow(self, painter):
         sp = self.p3(0,FLOOR_Y,0)
         painter.setPen(Qt.NoPen); painter.setBrush(QBrush(QColor(0,0,0,55)))
         painter.drawEllipse(sp, 95, 22)
 
-    def _draw_box(self, painter, cx, base_y, cz, bw, bh, bd,
+    def _draw_box(self, painter, wx, base_y, wz, bw, bh, bd,
                    front_col, side_col, top_col, glow=False):
         hw, hd  = bw/2, bd/2
         top_y   = base_y + bh
-        c = [
-            (cx-hw,base_y,cz-hd),(cx+hw,base_y,cz-hd),(cx+hw,top_y,cz-hd),(cx-hw,top_y,cz-hd),
-            (cx-hw,base_y,cz+hd),(cx+hw,base_y,cz+hd),(cx+hw,top_y,cz+hd),(cx-hw,top_y,cz+hd),
+        
+        # 8 corners in World Space
+        w_c = [
+            (wx-hw,base_y,wz-hd),(wx+hw,base_y,wz-hd),(wx+hw,top_y,wz-hd),(wx-hw,top_y,wz-hd),
+            (wx-hw,base_y,wz+hd),(wx+hw,base_y,wz+hd),(wx+hw,top_y,wz+hd),(wx-hw,top_y,wz+hd),
         ]
-        p = [self.p3(*v) for v in c]
+        
+        # Convert to Local Space
+        l_c = []
+        for (cx, cy, cz) in w_c:
+            lx, lz = self.world_to_local(cx, cz)
+            l_c.append((lx, cy, lz))
+            
+        p = [self.p3(*v) for v in l_c]
+        
         def face(idx, col):
             painter.setBrush(QBrush(col)); painter.setPen(QPen(col.darker(140),1))
             painter.drawPolygon(QPolygonF([p[i] for i in idx]))
@@ -206,21 +284,49 @@ class Robot3DWidget(QWidget):
         painter.setPen(QPen(QColor(148,163,184,70),2))
         painter.drawLine(p[0],p[1]); painter.drawLine(p[4],p[5])
 
-    def _draw_sensor_beam(self, painter, body_len, t):
-        pulse = (math.sin(t*(200/(self.distance+5)))+1)/2
-        a = int(35+90*pulse)
-        if self.distance<=20: col=QColor(239,68,68,a)
-        elif self.distance<=30: col=QColor(245,158,11,int(a*0.85))
-        else: col=QColor(16,185,129,int(a*0.6))
-        
-        blen = self.distance*2; tip = body_len/2
+    def _draw_ultrasonic_waves(self, painter, body_len, t):
         y_off = self.robot_y_offset
+        tip = body_len / 2
         
-        pts=[(0,y_off,tip),(-40,y_off-40,tip+blen),(40,y_off-40,tip+blen),(40,y_off+40,tip+blen),(-40,y_off+40,tip+blen)]
-        proj=[self.p3(*pt) for pt in pts]
-        painter.setPen(QPen(col.darker(),1,Qt.DashLine)); painter.setBrush(QBrush(col))
-        for i in range(1,4): painter.drawPolygon(QPolygonF([proj[0],proj[i],proj[i+1]]))
-        painter.drawPolygon(QPolygonF([proj[0],proj[4],proj[1]]))
+        speed   = 600.0   # Propagation speed (units per second)
+        spacing = 200.0   # Distance between wave fronts
+        
+        # ── Outgoing Pings (Cyan) ──
+        painter.setPen(QPen(QColor(6, 182, 212, 150), 2))
+        painter.setBrush(Qt.NoBrush)
+        
+        shift = (t * speed) % spacing
+        for i in range(4):
+            r = shift + i * spacing
+            if r > self.distance: continue # Stops immediately at obstacle surface
+            if r < 10: continue
+            
+            pts = []
+            for deg in range(-25, 26, 5):
+                rad = math.radians(deg)
+                pts.append(self.p3(r * math.sin(rad), y_off, tip + r * math.cos(rad)))
+            if len(pts) > 1:
+                painter.drawPolyline(QPolygonF(pts))
+
+        # ── Returning Echoes (Rose/Red) ──
+        # If the nearest obstacle is within 2500, we consider it hit by sound
+        if self.distance < 2500:
+            painter.setPen(QPen(QColor(244, 63, 94, 200), 2))
+            
+            # The echo travels backwards.
+            # To sync it properly with the outbound ping hitting the wall, we could use a pure physics time formula,
+            # but for visual representation, a simple retrograding wave is extremely effective.
+            echo_shift = spacing - ((t * speed * 2) % spacing)
+            for i in range(4):
+                r_echo = self.distance - (echo_shift + i * spacing)
+                if r_echo <= 0: continue
+                
+                pts = []
+                for deg in range(-20, 21, 5):
+                    rad = math.radians(deg)
+                    pts.append(self.p3(r_echo * math.sin(rad), y_off, tip + r_echo * math.cos(rad)))
+                if len(pts) > 1:
+                    painter.drawPolyline(QPolygonF(pts))
 
     def _draw_ik_leg(self, painter, idx, lx, ly, lz, q1, q2, color, roff):
         kx=lx; ky=ly+self.femur_len*math.sin(q1)+roff; kz=lz+self.femur_len*math.cos(q1)

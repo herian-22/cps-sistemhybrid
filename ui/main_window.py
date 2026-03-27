@@ -1,13 +1,17 @@
+import random
+import traceback
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QSlider, QPushButton, QFrame, QGridLayout,
                              QCheckBox, QScrollArea, QSizePolicy, QTabWidget,
-                             QSpinBox, QListWidget, QListWidgetItem)
+                             QSpinBox, QListWidget, QListWidgetItem, QMessageBox)
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont
 from core.logic import HybridSystemLogic, SystemMode, ControlMode
 from ui.widgets.robot_3d import Robot3DWidget
-from ui.widgets.analytics import StateDiagramWidget, RealTimePlotWidget, SignalPanel
+from ui.widgets.analytics import RealTimePlotWidget, SignalPanel
 from ui.widgets.gauges import ServoWidget, DistanceWidget
+from ui.widgets.rviz_map import RVizMapWidget
+from core.logger import log
 
 # ── Color palette ─────────────────────────────────────────────────────────────
 C = dict(
@@ -86,6 +90,7 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self.update_simulation)
         self.timer.start(50)
         self._init_ui()
+        self.refresh_obs_list()
 
     # ── Build UI ──────────────────────────────────────────────────────────────
     def _init_ui(self):
@@ -95,6 +100,12 @@ class MainWindow(QMainWindow):
         vlay.addWidget(self._navbar())
 
         self.tabs = QTabWidget()
+        self.tabs.tabBar().hide()
+        self.score_label = QLabel("🏆 SCORE: 100.0 | COLL: 0")
+        self.score_label.setAlignment(Qt.AlignCenter)
+        self.score_label.setStyleSheet("font-size: 18px; font-weight: bold; color: #ffcc00; background: #222; padding: 5px;")
+        
+        vlay.addWidget(self.score_label)
         vlay.addWidget(self.tabs, 1)
 
         # Tab 1: Live Simulation
@@ -119,7 +130,12 @@ class MainWindow(QMainWindow):
         sep.setStyleSheet(f"color:{C['border']};"); lay.addWidget(sep)
         for name in ("Dashboard","3D Simulation","Analytics"):
             btn = QPushButton(name); btn.setObjectName("NavBtn")
+            idx = 1 if name == "Dashboard" else 0
+            btn.clicked.connect(lambda _=None, i=idx: hasattr(self, 'tabs') and self.tabs.setCurrentIndex(i))
             lay.addWidget(btn)
+        btn_line = QPushButton("🛤️ LINE"); btn_line.clicked.connect(lambda: self.load_preset(4))
+        btn_line.setStyleSheet("background-color: #555;")
+        lay.addWidget(btn_line)
         lay.addStretch()
         self.mode_badge = QLabel("● WALKING")
         self.mode_badge.setStyleSheet(f"color:{C['green']};font-weight:bold;font-size:14px;")
@@ -148,7 +164,7 @@ class MainWindow(QMainWindow):
         self.btn_mode.setToolTip("AUTO: robot advances automatically and evades")
         self.btn_mode.clicked.connect(self.toggle_control)
         btn_reset = QPushButton("↺  RESET"); btn_reset.setObjectName("Sec")
-        btn_reset.clicked.connect(self.reset_sim)
+        btn_reset.clicked.connect(self.reset_simulation)
         self.btn_zeno = QPushButton("⚡  ZENO MODE"); self.btn_zeno.setObjectName("Zeno")
         self.btn_zeno.clicked.connect(self.toggle_zeno)
         ilay.addWidget(_sec("Simulation", [self.btn_run, self.btn_mode, btn_reset,
@@ -180,10 +196,11 @@ class MainWindow(QMainWindow):
         # ── Servo gauges ──────────────────────────────────────────────────────
         self.gauges = []
         gg = QWidget(); gl = QGridLayout(gg); gl.setContentsMargins(0,0,0,0); gl.setSpacing(4)
-        for i in range(4):
-            g = ServoWidget(f"S{i+1}"); self.gauges.append(g); g.setFixedHeight(105)
+        names = ["FL-F", "FL-T", "FR-F", "FR-T", "BL-F", "BL-T", "BR-F", "BR-T"]
+        for i in range(8):
+            g = ServoWidget(names[i]); self.gauges.append(g); g.setFixedHeight(105)
             gl.addWidget(g, i//2, i%2)
-        ilay.addWidget(_sec("Servo Gauges", [gg]))
+        ilay.addWidget(_sec("Servo Gauges (F=Femur, T=Tibia)", [gg]))
 
         scroll.setWidget(inner); vlay.addWidget(scroll)
         return outer
@@ -201,8 +218,8 @@ class MainWindow(QMainWindow):
         strip.setStyleSheet(f"background:{C['surface']};border-top:1px solid {C['border']};")
         slay = QHBoxLayout(strip); slay.setContentsMargins(10,6,10,6); slay.setSpacing(10)
 
-        self.state_diag = StateDiagramWidget(); self.state_diag.setFixedWidth(280)
-        slay.addWidget(self.state_diag)
+        self.rviz_map = RVizMapWidget(); self.rviz_map.setFixedWidth(280)
+        slay.addWidget(self.rviz_map)
 
         vsep = QFrame(); vsep.setFrameShape(QFrame.VLine)
         vsep.setStyleSheet(f"color:{C['border']}"); slay.addWidget(vsep)
@@ -275,14 +292,27 @@ class MainWindow(QMainWindow):
         ol.addWidget(QLabel("Add static obstacles. Evasion triggers if distance to robot front ≤ 25cm."))
 
         form = QGridLayout(); form.setContentsMargins(0,10,0,10)
-        form.addWidget(QLabel("X (lateral):"), 0,0); self.spin_x = QSpinBox(); self.spin_x.setRange(-500,500); self.spin_x.setValue(0); form.addWidget(self.spin_x, 0,1)
-        form.addWidget(QLabel("Z (depth):"), 0,2);   self.spin_z = QSpinBox(); self.spin_z.setRange(0,3000); self.spin_z.setValue(300); form.addWidget(self.spin_z, 0,3)
-        form.addWidget(QLabel("Width:"), 1,0);       self.spin_w = QSpinBox(); self.spin_w.setRange(10,500); self.spin_w.setValue(60); form.addWidget(self.spin_w, 1,1)
-        form.addWidget(QLabel("Height:"), 1,2);      self.spin_h = QSpinBox(); self.spin_h.setRange(10,500); self.spin_h.setValue(90); form.addWidget(self.spin_h, 1,3)
+        form.addWidget(QLabel("Map Presets (Auto-generate obstacles):"), 0,0,1,4)
+        
+        btn_e = QPushButton("🟩 EASY"); btn_e.clicked.connect(lambda: self.load_preset(1))
+        btn_m = QPushButton("🟨 MEDIUM"); btn_m.clicked.connect(lambda: self.load_preset(2))
+        btn_h = QPushButton("🟥 HARD"); btn_h.clicked.connect(lambda: self.load_preset(3))
+        form.addWidget(btn_e, 1,0); form.addWidget(btn_m, 1,1)
+        form.addWidget(btn_h, 1,2, 1,2)
+
+        form.addWidget(QLabel("Or add obstacles manually:"), 2,0,1,4)
+        form.addWidget(QLabel("X (lateral):"), 3,0); self.spin_x = QSpinBox(); self.spin_x.setRange(-500,500); self.spin_x.setValue(0); form.addWidget(self.spin_x, 3,1)
+        form.addWidget(QLabel("Z (depth):"), 3,2);   self.spin_z = QSpinBox(); self.spin_z.setRange(0,3000); self.spin_z.setValue(300); form.addWidget(self.spin_z, 3,3)
+        form.addWidget(QLabel("Width:"), 4,0);       self.spin_w = QSpinBox(); self.spin_w.setRange(10,500); self.spin_w.setValue(60); form.addWidget(self.spin_w, 4,1)
+        form.addWidget(QLabel("Height:"), 4,2);      self.spin_h = QSpinBox(); self.spin_h.setRange(10,500); self.spin_h.setValue(90); form.addWidget(self.spin_h, 4,3)
         ol.addLayout(form)
 
         btn_add = QPushButton("➕ ADD OBSTACLE"); btn_add.clicked.connect(self.add_custom_obs)
         ol.addWidget(btn_add)
+
+        btn_reset = QPushButton("🔄 RESET")
+        btn_reset.clicked.connect(self.reset_simulation)
+        ol.addWidget(btn_reset)
 
         self.obs_list = QListWidget(); self.obs_list.setFixedHeight(150)
         ol.addWidget(self.obs_list)
@@ -298,6 +328,78 @@ class MainWindow(QMainWindow):
         play.addLayout(right_col, 1)
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
+    def load_preset(self, p):
+        # Map descriptions for the preview dialog
+        descriptions = {
+            1: ("\ud83d\udfe9 EASY \u2014 Rintangan Ringan\n\n"
+                "Layout:\n"
+                "\u2022 1 Blok Beton (150\u00d7150 cm) di posisi Z=1000\n"
+                "\u2022 Lurus di depan robot\n\n"
+                "Cocok untuk menguji deteksi sensor dasar."),
+            2: ("\ud83d\udfe8 MEDIUM \u2014 Rintangan Sedang\n\n"
+                "Layout:\n"
+                "\u2022 Blok 1 (150\u00d7150 cm) di X=+80, Z=800\n"
+                "\u2022 Blok 2 (150\u00d7150 cm) di X=-80, Z=1600\n\n"
+                "Pola zig-zag. Robot harus bermanuver A* ke kiri-kanan."),
+            3: ("\ud83d\udfe5 HARD \u2014 Rintangan Sulit\n\n"
+                "Layout:\n"
+                "\u2022 Blok 1 (250\u00d7250 cm) di X=+150, Z=800\n"
+                "\u2022 Blok 2 (250\u00d7250 cm) di X=-150, Z=1600\n"
+                "\u2022 Blok 3 (250\u00d7250 cm) di X=+150, Z=2400\n"
+                "\u2022 Blok 4 (300\u00d7300 cm) di X=-150, Z=3200\n\n"
+                "Lorong sempit zigzag. Memaksa A* Path Planning ekstrem!"),
+            4: ("\ud83d\uddfa\ufe0f LINE FOLLOWER \u2014 Jalur Edukasi\n\n"
+                "Layout:\n"
+                "\u2022 Jalur berbentuk S-Curve yang digambar di grid.\n"
+                "\u2022 Robot akan mencoba mengikuti jalur ini.\n\n"
+                "Mengaktifkan mode Line Follower untuk menguji kemampuan pelacakan jalur.")
+        }
+        
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Preview Map")
+        msg.setText(descriptions.get(p, ""))
+        msg.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
+        msg.setDefaultButton(QMessageBox.Ok)
+        msg.setStyleSheet(f"QMessageBox {{ background: {C['bg']}; color: {C['text']}; }} "
+                          f"QPushButton {{ padding: 6px 20px; }}")
+        
+        if msg.exec() != QMessageBox.Ok:
+            return  # User cancelled
+        try:
+            log(f"Loading preset {p}...")
+            # Reset simulation first
+            self.reset_simulation()
+            
+            grid_ref = self.logic.occupancy_grid.grid
+            grid_ref.fill(0.1) # Baseline small unknown
+            
+            if p == 1:
+                self.logic.add_custom_obstacle(0, 1500, 0, 400, 100, 100)
+            elif p == 2:
+                self.logic.add_custom_obstacle(800, 1200, 0, 200, 200, 200)
+                self.logic.add_custom_obstacle(-800, 2000, 0, 200, 200, 200)
+            elif p == 3:
+                for _ in range(8):
+                    self.logic.add_custom_obstacle(random.uniform(-1000, 1000), random.uniform(800, 2500), 0, 150, 150, 150)
+            elif p == 4:
+                log("Generating educational track...")
+                # S-Curve line
+                points = [(0, 0), (0, 1000), (500, 1500), (0, 2000), (-500, 2500), (0, 3000)]
+                for i in range(len(points) - 1):
+                    # Assuming draw_line takes x1, y1, x2, y2
+                    self.logic.occupancy_grid.draw_line(points[i][0], points[i][1], points[i+1][0], points[i+1][1])
+                self.logic.state.mode = SystemMode.FOLLOWING
+                log("Line Follower Mode Activated.")
+            self.refresh_obs_list()
+        except Exception as e:
+            print(f"ERROR in load_preset: {e}")
+            traceback.print_exc()
+            QMessageBox.critical(self, "Preset Error", f"Failed to load preset: {e}\n\nCheck terminal for details.")
+        
+        # Switch to 3D tab
+        if hasattr(self, 'tabs'):
+            self.tabs.setCurrentIndex(0)
+
     def add_custom_obs(self):
         x, z = self.spin_x.value(), self.spin_z.value()
         w, h = self.spin_w.value(), self.spin_h.value()
@@ -346,7 +448,8 @@ class MainWindow(QMainWindow):
             self.btn_zeno.setText("⚡  ZENO MODE")
         self.btn_zeno.setStyle(self.btn_zeno.style())
 
-    def reset_sim(self):
+    def reset_simulation(self):
+        log("Resetting simulation...")
         self.logic.reset(); self.logic.is_running = False
         self.dist_slider.setValue(100)
         self.btn_run.setText("▶  START")
@@ -359,25 +462,42 @@ class MainWindow(QMainWindow):
 
     # ── Update loop ───────────────────────────────────────────────────────────
     def update_simulation(self):
-        if self.logic.is_running:
+        if not self.logic.is_running: return
+        try:
             self.logic.update()
+            
+            # Update Scoreboard
+            m = self.logic.metrics
+            self.score_label.setText(f"🏆 SCORE: {m.score:.1f} | COLL: {m.collisions}")
+            
+            # Update Widgets
+            self.robot_3d.setParams(self.logic)
+            self.rviz_map.setParams(self.logic)
+            self.plot.setData(self.logic.history_servos)
+            self.sig_panel.setData(
+                self.logic.history_raw,
+                self.logic.history_filtered,
+                getattr(self.logic, 'quantized_event', None)
+            )
+            
+            for i in range(min(8, len(self.gauges))):
+                self.gauges[i].setAngle(self.logic.servo_angles[i])
+            
+            # Navbar badges
+            col = C['green'] if self.logic.state.mode == SystemMode.WALKING else C['amber']
+            if self.logic.state.mode == SystemMode.HALTING: col = C['red']
+            
+            self.mode_badge.setText(f"● {self.logic.state.mode.value}")
+            self.mode_badge.setStyleSheet(f"color:{col};font-weight:bold;font-size:14px;")
+            
+            zt = " ⚡" if self.logic.zeno_mode else ""
+            at = " [AUTO]" if self.logic.control == ControlMode.AUTO else ""
+            self.trans_label.setText(f"  Transitions: {self.logic.transition_count}{zt}{at}")
+            
+        except Exception as e:
+            log(f"Simulation Error: {e}", "ERROR")
+            traceback.print_exc()
 
-        self.robot_3d.setParams(self.logic)
-        self.state_diag.setMode(self.logic.mode, self.logic.just_transitioned)
-        self.plot.setData(self.logic.history_servos)
-        self.sig_panel.setData(
-            self.logic.history_raw,
-            self.logic.history_filtered,
-            self.logic.quantized_event
-        )
-        for i in range(4):
-            self.gauges[i].setAngle(self.logic.servo_angles[i])
-
-        # Navbar badges
-        walking = (self.logic.mode == SystemMode.WALKING)
-        col = C['green'] if walking else C['red']
-        self.mode_badge.setText(f"● {self.logic.mode.value}")
-        self.mode_badge.setStyleSheet(f"color:{col};font-weight:bold;font-size:14px;")
-        zt = " ⚡" if self.logic.zeno_mode else ""
-        at = " [AUTO]" if self.logic.control == ControlMode.AUTO else ""
-        self.trans_label.setText(f"  Transitions: {self.logic.transition_count}{zt}{at}")
+    def closeEvent(self, event):
+        self.logic.stop()
+        event.accept()
